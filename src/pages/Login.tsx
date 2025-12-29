@@ -46,8 +46,8 @@ export function Login() {
                             <path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11" />
                         </svg>
                     </div>
-                    <h1>Welcome Back</h1>
-                    <p>Sign in to continue to TaskFlow</p>
+                    <h1>Welcome Back!</h1>
+                    <p>Sign in to manage your tasks efficiently</p>
                 </div>
 
                 <form className="auth-form" onSubmit={handleSubmit}>
