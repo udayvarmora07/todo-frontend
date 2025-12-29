@@ -3,16 +3,27 @@ name: Build and Deploy Frontend
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., 1.0.0)'
+        required: false
+        default: ''
+
+# Prevent concurrent builds on the same ref
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   id-token: write
   contents: write
   packages: write
+  security-events: write
 
 env:
-  # Cache image tags - used for layer caching in both registries
   GHCR_CACHE: ghcr.io/${{ github.repository }}:buildcache
-  # ECR cache will be set after login
+  NODE_VERSION: '22.17.0'
 
 jobs:
   build-and-push:
@@ -23,6 +34,7 @@ jobs:
     outputs:
       image_tag: ${{ steps.meta.outputs.BUILD_VERSION }}
       ecr_image: ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ steps.meta.outputs.BUILD_VERSION }}
+      ghcr_image: ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.BUILD_VERSION }}
 
     steps:
       # =========================================================================
@@ -30,31 +42,35 @@ jobs:
       # =========================================================================
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Generate image tags and metadata
+      - name: Generate build metadata
         id: meta
         run: |
-          # Get release tag or fallback to short SHA
+          # Determine version from release, input, or SHA
           if [ "${{ github.event_name }}" == "release" ]; then
-            RELEASE_TAG="${{ github.event.release.tag_name }}"
+            VERSION="${{ github.event.release.tag_name }}"
+          elif [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
           else
-            RELEASE_TAG="${GITHUB_SHA::7}"
-          fi
-          
-          if [ -z "$RELEASE_TAG" ]; then
-            RELEASE_TAG="${GITHUB_SHA::7}"
-            echo "⚠️ No release tag found, using short SHA: $RELEASE_TAG"
+            VERSION="${GITHUB_SHA::7}"
           fi
           
           # Remove 'v' prefix if present
-          BUILD_VERSION="${RELEASE_TAG#v}"
+          BUILD_VERSION="${VERSION#v}"
+          
+          # Validate semver format (loose check)
+          if [[ ! "$BUILD_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] && [[ ! "$BUILD_VERSION" =~ ^[a-f0-9]{7}$ ]]; then
+            echo "⚠️ Warning: Version '$BUILD_VERSION' is not semver format"
+          fi
           
           echo "BUILD_VERSION=${BUILD_VERSION}" >> $GITHUB_OUTPUT
-          echo "RELEASE_TAG=${RELEASE_TAG}" >> $GITHUB_OUTPUT
           echo "BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+          echo "GIT_SHA=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
           
-          echo "📋 Release Tag: $RELEASE_TAG"
           echo "📋 Build Version: $BUILD_VERSION"
+          echo "📋 Git SHA: ${GITHUB_SHA::7}"
 
       - name: Validate build version
         run: |
@@ -100,16 +116,22 @@ jobs:
         with:
           images: |
             ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}
-            ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+            ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=${{ steps.meta.outputs.BUILD_VERSION }}
             type=raw,value=latest
             type=sha,prefix=sha-,format=short
+          labels: |
+            org.opencontainers.image.title=Todo Frontend
+            org.opencontainers.image.version=${{ steps.meta.outputs.BUILD_VERSION }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.BUILD_DATE }}
+            org.opencontainers.image.revision=${{ github.sha }}
 
       # =========================================================================
-      # Build & Push Docker Image with Dual Registry Caching
+      # Build & Push Docker Image
       # =========================================================================
       - name: Build and push Docker image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -117,7 +139,8 @@ jobs:
           push: true
           tags: ${{ steps.docker-meta.outputs.tags }}
           labels: ${{ steps.docker-meta.outputs.labels }}
-          # Dual registry caching - try ECR first (faster in AWS), fallback to GHCR
+          build-args: |
+            NODE_VERSION=${{ env.NODE_VERSION }}
           cache-from: |
             type=registry,ref=${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:buildcache
             type=registry,ref=${{ env.GHCR_CACHE }}
@@ -126,6 +149,24 @@ jobs:
             type=registry,ref=${{ env.GHCR_CACHE }},mode=max
           provenance: false
           sbom: false
+
+      # =========================================================================
+      # Security Scanning
+      # =========================================================================
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.BUILD_VERSION }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
 
       # =========================================================================
       # Post-Build Steps
@@ -137,7 +178,8 @@ jobs:
           script: |
             const release = context.payload.release;
             const ecrImage = "${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ steps.meta.outputs.BUILD_VERSION }}";
-            const ghcrImage = "ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:${{ steps.meta.outputs.BUILD_VERSION }}";
+            const ghcrImage = "ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.BUILD_VERSION }}";
+            const digest = "${{ steps.build.outputs.digest }}";
             
             const imageDetails = `
 
@@ -145,23 +187,27 @@ jobs:
 
             ## 🐳 Docker Images
 
-            | Registry | Image |
-            |----------|-------|
-            | **ECR** | \`${ecrImage}\` |
-            | **GHCR** | \`${ghcrImage}\` |
+            | Registry | Image | Digest |
+            |----------|-------|--------|
+            | **ECR** | \`${ecrImage}\` | \`${digest.slice(0, 20)}...\` |
+            | **GHCR** | \`${ghcrImage}\` | \`${digest.slice(0, 20)}...\` |
 
             ### Pull Commands
             \`\`\`bash
-            # From ECR
+            # From ECR (AWS)
             docker pull ${ecrImage}
 
-            # From GHCR
+            # From GHCR (Public)
             docker pull ${ghcrImage}
             \`\`\`
 
             ### Runtime Configuration
             Set these environment variables in App Runner:
-            - \`VITE_API_URL\` - Backend API URL
+            - \`VITE_API_URL\` - Backend API URL (required)
+
+            ### Security
+            - ✅ Vulnerability scan completed
+            - 📋 Results available in Security tab
             `;
             
             await github.rest.repos.updateRelease({
@@ -178,14 +224,20 @@ jobs:
           echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| **Version** | \`${{ steps.meta.outputs.BUILD_VERSION }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Commit** | \`${GITHUB_SHA::7}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ steps.meta.outputs.GIT_SHA }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Build Date** | ${{ steps.meta.outputs.BUILD_DATE }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Cache (ECR)** | \`${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:buildcache\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Cache (GHCR)** | \`${{ env.GHCR_CACHE }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Node Version** | ${{ env.NODE_VERSION }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Digest** | \`${{ steps.build.outputs.digest }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### 📦 Docker Images" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- **ECR**: \`${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ steps.meta.outputs.BUILD_VERSION }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **GHCR**: \`ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:${{ steps.meta.outputs.BUILD_VERSION }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **GHCR**: \`ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.BUILD_VERSION }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "> **Note**: This image builds at container startup. Set \`VITE_API_URL\` in App Runner environment." >> $GITHUB_STEP_SUMMARY
+          echo "### 🔒 Security" >> $GITHUB_STEP_SUMMARY
+          echo "- Trivy vulnerability scan completed" >> $GITHUB_STEP_SUMMARY
+          echo "- Results uploaded to Security tab" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📝 Cache" >> $GITHUB_STEP_SUMMARY
+          echo "- ECR: \`${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:buildcache\`" >> $GITHUB_STEP_SUMMARY
+          echo "- GHCR: \`${{ env.GHCR_CACHE }}\`" >> $GITHUB_STEP_SUMMARY
