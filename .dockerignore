@@ -1,16 +1,28 @@
 # Ignore patterns for Docker build context
+# CRITICAL: These exclusions ensure consistent cache keys
+
+# Dependencies (will be installed fresh)
 node_modules
+
+# Build output
 dist
+build
+
+# Git
 .git
 .gitignore
-*.md
-.env
-.env.*
-!.env.example
+
+# IDE
 .vscode
 .idea
+*.swp
+*.swo
+
+# Logs
 *.log
 npm-debug.log*
+
+# Test files
 coverage
 .nyc_output
 *.test.ts
@@ -18,3 +30,26 @@ coverage
 *.spec.ts
 *.spec.tsx
 __tests__
+
+# Environment files (built at runtime)
+.env
+.env.*
+!.env.example
+
+# CI/CD - CRITICAL for cache consistency
+.github
+
+# Documentation
+README.md
+LICENSE
+docs
+*.md
+
+# Docker files (don't include in context)
+Dockerfile*
+docker-compose*
+.dockerignore
+
+# Misc
+.DS_Store
+Thumbs.db

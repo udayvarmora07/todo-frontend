@@ -9,6 +9,11 @@ permissions:
   contents: write
   packages: write
 
+env:
+  # Cache image tags - used for layer caching in both registries
+  GHCR_CACHE: ghcr.io/${{ github.repository }}:buildcache
+  # ECR cache will be set after login
+
 jobs:
   build-and-push:
     name: Build & Push Docker Image
@@ -81,17 +86,13 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # =========================================================================
-      # Docker Build Setup with Caching
+      # Docker Build Setup
       # =========================================================================
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: |
-            image=moby/buildkit:latest
-            network=host
 
       - name: Extract Docker metadata
         id: docker-meta
@@ -106,7 +107,7 @@ jobs:
             type=sha,prefix=sha-,format=short
 
       # =========================================================================
-      # Build & Push Docker Image (NO build-args needed!)
+      # Build & Push Docker Image with Dual Registry Caching
       # =========================================================================
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
@@ -116,8 +117,13 @@ jobs:
           push: true
           tags: ${{ steps.docker-meta.outputs.tags }}
           labels: ${{ steps.docker-meta.outputs.labels }}
-          cache-from: type=gha,scope=frontend-build
-          cache-to: type=gha,mode=max,scope=frontend-build
+          # Dual registry caching - try ECR first (faster in AWS), fallback to GHCR
+          cache-from: |
+            type=registry,ref=${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:buildcache
+            type=registry,ref=${{ env.GHCR_CACHE }}
+          cache-to: |
+            type=registry,ref=${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:buildcache,mode=max
+            type=registry,ref=${{ env.GHCR_CACHE }},mode=max
           provenance: false
           sbom: false
 
@@ -174,6 +180,8 @@ jobs:
           echo "| **Version** | \`${{ steps.meta.outputs.BUILD_VERSION }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Commit** | \`${GITHUB_SHA::7}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Build Date** | ${{ steps.meta.outputs.BUILD_DATE }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Cache (ECR)** | \`${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:buildcache\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Cache (GHCR)** | \`${{ env.GHCR_CACHE }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### 📦 Docker Images" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
